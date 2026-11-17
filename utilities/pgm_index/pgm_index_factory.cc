@@ -6,6 +6,12 @@
 #include "utilities/pgm_index/pgm_index_factory.h"
 
 #include "util/coding.h"
+#include <algorithm>
+#include <cassert>
+#include <exception>
+#include <limits>
+
+#include "pgm/pgm_index.hpp"
 
 namespace ROCKSDB_NAMESPACE {
 namespace pgm_index {
@@ -59,9 +65,32 @@ uint64_t PgmIndexBuilder::EstimatedSize() const {
   return total;
 }
 
+// ---- Helpers ----
+uint64_t KeyToU64(const Slice& key) {
+  uint64_t v = 0;
+  const size_t n = std::min<size_t>(key.size(), 8);
+  for (size_t i = 0; i < 8; ++i) {
+    // Zero pad on the right so shorter keys sort before their extensions.
+    v = (v << 8) | (i < n ? static_cast<unsigned char>(key[i]) : 0u);
+  }
+  // PGM reserves numeric_limits<uint64_t>::max() as a sentinel.
+  constexpr uint64_t kMax = std::numeric_limits<uint64_t>::max();
+  return v == kMax ? kMax - 1 : v;
+}
+
+// PGM model: error at most 16 positions at the bottom level, 4 above.
+struct PgmModelHolder {
+  using Model = pgm::PGMIndex<uint64_t, 16, 4, float>;
+  explicit PgmModelHolder(const std::vector<uint64_t>& keys)
+      : model(keys.begin(), keys.end()) {}
+  Model model;
+};
+
 // ---- Reader ----
 PgmIndexReader::PgmIndexReader(const Comparator* comparator)
     : comparator_(comparator) {}
+
+PgmIndexReader::~PgmIndexReader() = default;
 
 Status PgmIndexReader::InitFromSlice(const Slice& data) {
   data_size_ = data.size();
@@ -88,7 +117,37 @@ Status PgmIndexReader::InitFromSlice(const Slice& data) {
     }
     entries_.push_back(e);
   }
+
+  // Distinct 8-byte prefixes, and where each group of equal prefixes starts.
+  prefixes_.clear();
+  group_start_.clear();
+  for (size_t i = 0; i < entries_.size(); ++i) {
+    const uint64_t k = KeyToU64(entries_[i].separator);
+    if (prefixes_.empty() || prefixes_.back() != k) {
+      if (!prefixes_.empty() && k < prefixes_.back()) {
+        return Status::Corruption("PGM index: separators not sorted");
+      }
+      prefixes_.push_back(k);
+      group_start_.push_back(static_cast<uint32_t>(i));
+    }
+  }
+  group_start_.push_back(static_cast<uint32_t>(entries_.size()));
+
+  // Train the PGM model on the distinct prefixes.
+  pgm_.reset();
+  if (!prefixes_.empty()) {
+    try {
+      pgm_ = std::make_unique<PgmModelHolder>(prefixes_);
+    } catch (const std::exception& ex) {
+      return Status::Corruption(std::string("PGM index: training failed: ") +
+                                ex.what());
+    }
+  }
   return Status::OK();
+}
+
+size_t PgmIndexReader::NumSegments() const {
+  return pgm_ ? pgm_->model.segments_count() : 0;
 }
 
 std::unique_ptr<UserDefinedIndexIterator> PgmIndexReader::NewIterator(
@@ -97,20 +156,59 @@ std::unique_ptr<UserDefinedIndexIterator> PgmIndexReader::NewIterator(
 }
 
 size_t PgmIndexReader::ApproximateMemoryUsage() const {
-  return data_size_ + entries_.capacity() * sizeof(Entry);
+  return data_size_ + entries_.capacity() * sizeof(Entry) +
+         prefixes_.capacity() * sizeof(uint64_t) +
+         group_start_.capacity() * sizeof(uint32_t) +
+         (pgm_ ? sizeof(PgmModelHolder) + pgm_->model.size_in_bytes() : 0);
 }
 
-// ---- Reader::Seek (plain binary search, PGM comes later) ----
+bool PgmIndexReader::EntryBefore(size_t i, const Slice& target,
+                                 uint64_t target_tag) const {
+  const Entry& e = entries_[i];
+  const int c = comparator_->Compare(e.separator, target);
+  // Higher tag sorts first, so an equal key with a higher tag is before.
+  return c < 0 || (c == 0 && target_tag < e.tag);
+}
+
+// ---- Reader::Seek (PGM window + search inside the prefix group) ----
 size_t PgmIndexReader::Seek(const Slice& target, uint64_t target_tag) const {
-  size_t lo = 0;
-  size_t hi = entries_.size();
+  const size_t num_groups = prefixes_.size();
+  if (num_groups == 0) {
+    return 0;
+  }
+  const uint64_t k = KeyToU64(target);
+
+  // 1) The model gives an approximate position and a small window [lo, hi)
+  //    that must contain the first prefix >= k.
+  const auto approx = pgm_->model.search(k);
+  const auto first = prefixes_.begin() + approx.lo;
+  const auto last = prefixes_.begin() + approx.hi;
+  size_t g =
+      static_cast<size_t>(std::lower_bound(first, last, k) - prefixes_.begin());
+  // The model guarantees the window. Guard anyway, so a model bug can never
+  // return a wrong block.
+  if ((g > 0 && prefixes_[g - 1] >= k) ||
+      (g < num_groups && prefixes_[g] < k)) {
+    assert(false);
+    g = static_cast<size_t>(
+        std::lower_bound(prefixes_.begin(), prefixes_.end(), k) -
+        prefixes_.begin());
+  }
+  if (g == num_groups) {
+    return entries_.size();
+  }
+
+  // 2) Groups before g have prefix < k, groups after g have prefix > k. If
+  //    the prefix of group g is larger than k, the whole group is after the
+  //    target. Otherwise compare full keys (and tags) inside the group.
+  size_t lo = group_start_[g];
+  size_t hi = group_start_[g + 1];
+  if (prefixes_[g] != k) {
+    return lo;
+  }
   while (lo < hi) {
     const size_t mid = lo + (hi - lo) / 2;
-    const Entry& e = entries_[mid];
-    const int c = comparator_->Compare(e.separator, target);
-    // Higher tag sorts first, so an equal key with a higher tag is before.
-    const bool before = c < 0 || (c == 0 && target_tag < e.tag);
-    if (before) {
+    if (EntryBefore(mid, target, target_tag)) {
       lo = mid + 1;
     } else {
       hi = mid;

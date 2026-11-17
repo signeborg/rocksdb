@@ -44,9 +44,18 @@ class PgmIndexBuilder final : public UserDefinedIndexBuilder {
   bool finished_ = false;
 };
 
+// Maps the first 8 bytes of a key to a uint64_t (big-endian, zero padded).
+// Preserves bytewise order: a < b implies KeyToU64(a) <= KeyToU64(b).
+uint64_t KeyToU64(const Slice& key);
+
+// The PGM model type lives in the .cc file (pimpl) so the third-party header
+// does not leak into every includer of this file.
+struct PgmModelHolder;
+
 class PgmIndexReader final : public UserDefinedIndexReader {
  public:
   explicit PgmIndexReader(const Comparator* comparator);
+  ~PgmIndexReader() override;
   Status InitFromSlice(const Slice& data);
   std::unique_ptr<UserDefinedIndexIterator> NewIterator(
       const ReadOptions& read_options) override;
@@ -60,15 +69,24 @@ class PgmIndexReader final : public UserDefinedIndexReader {
   };
   size_t NumEntries() const { return entries_.size(); }
   const Entry& GetEntry(size_t i) const { return entries_[i]; }
+  size_t NumSegments() const;
 
   // Index of the first entry whose (separator, tag) is >= (target,
   // target_tag) in internal key order, or NumEntries() if there is none.
   size_t Seek(const Slice& target, uint64_t target_tag) const;
 
  private:
+  // True if entry i sorts strictly before (target, target_tag).
+  bool EntryBefore(size_t i, const Slice& target, uint64_t target_tag) const;
+
   const Comparator* comparator_;
   std::vector<Entry> entries_;
   size_t data_size_ = 0;
+  // Distinct KeyToU64(separator) values, ascending, and for each the index
+  // of its first entry. group_start_[prefixes_.size()] == entries_.size().
+  std::vector<uint64_t> prefixes_;
+  std::vector<uint32_t> group_start_;
+  std::unique_ptr<PgmModelHolder> pgm_;
 };
 
 class PgmIndexIterator final : public UserDefinedIndexIterator {
