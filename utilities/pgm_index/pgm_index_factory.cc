@@ -5,26 +5,59 @@
 
 #include "utilities/pgm_index/pgm_index_factory.h"
 
+#include "util/coding.h"
+
 namespace ROCKSDB_NAMESPACE {
 namespace pgm_index {
 
-// ---- Builder (stub) ----
+// ---- Builder ----
 PgmIndexBuilder::PgmIndexBuilder(const Comparator* comparator)
     : comparator_(comparator) {}
 
 Slice PgmIndexBuilder::AddIndexEntry(const Slice& last_key_in_current_block,
-                                     const Slice* /*first_key_in_next_block*/,
-                                     const BlockHandle& /*block_handle*/,
+                                     const Slice* first_key_in_next_block,
+                                     const BlockHandle& block_handle,
                                      std::string* /*separator_scratch*/,
-                                     const IndexEntryContext& /*context*/) {
-  return last_key_in_current_block;  // TODO: store entry
+                                     const IndexEntryContext& context) {
+  // A real tag is only needed when the same user key continues in the next
+  // block (or this is the last block). Otherwise 0 = "any seqno of this key".
+  uint64_t tag = 0;
+  if (first_key_in_next_block == nullptr ||
+      comparator_->Compare(last_key_in_current_block,
+                           *first_key_in_next_block) == 0) {
+    tag = context.last_key_tag;
+  }
+  entries_.push_back({last_key_in_current_block.ToString(), tag,
+                      block_handle.offset, block_handle.size});
+  return Slice(entries_.back().separator);
 }
 
-Status PgmIndexBuilder::Finish(Slice* /*index_contents*/) {
-  return Status::NotSupported("TODO");
+Status PgmIndexBuilder::Finish(Slice* index_contents) {
+  buffer_.clear();
+  PutFixed32(&buffer_, 1);  // format version
+  PutVarint64(&buffer_, entries_.size());
+  for (const Entry& e : entries_) {
+    PutLengthPrefixedSlice(&buffer_, Slice(e.separator));
+    PutVarint64(&buffer_, e.tag);
+    PutVarint64(&buffer_, e.offset);
+    PutVarint64(&buffer_, e.size);
+  }
+  *index_contents = Slice(buffer_);
+  finished_ = true;
+  return Status::OK();
 }
 
-uint64_t PgmIndexBuilder::EstimatedSize() const { return 0; }
+uint64_t PgmIndexBuilder::EstimatedSize() const {
+  if (finished_) {
+    return buffer_.size();
+  }
+  // Upper bound: version + count + per entry (length + 3 varints <= 35 B).
+  uint64_t total = 4 + 10;
+  for (const Entry& e : entries_) {
+    total += e.separator.size() + 35;
+  }
+  return total;
+}
 
 // ---- Reader (stub) ----
 PgmIndexReader::PgmIndexReader(const Comparator* comparator)
