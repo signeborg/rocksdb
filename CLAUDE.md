@@ -443,3 +443,61 @@ rather than relying on libstdc++ transitive includes.
 ### Formatting code
 * After making change, use `make format-auto` to auto-apply formatting without
     interactive prompts (Claude Code friendly).
+
+## PGM index (utilities/pgm_index): plan
+
+Branch: `pgm-index` (from RocksDB v11.8.1). Goal: a per-block learned index
+(PGM-index, Ferragina & Vinciguerra) implemented as a User Defined Index (UDI),
+so RocksDB's own index code stays untouched. One entry per data block, like the
+default index and the trie UDI. Per-key models need a position inside the block,
+which the UDI interface cannot return (RocksDB only gets a BlockHandle), so that
+variant will need changes in the block-based table index code later.
+
+### Interface (include/rocksdb/user_defined_index.h)
+- Builder: `AddIndexEntry`, `Finish`, `EstimatedSize` (`OnKeyAdded` stays a no-op).
+- Iterator: `Prepare`, `SeekAndGetResult`, `NextAndGetResult`, `value`; also
+  `SeekToFirst/SeekToLast/PrevAndGetResult` for reverse scans.
+- Reader: `NewIterator`, `ApproximateMemoryUsage`.
+- Factory: `NewBuilder(option, builder)`, `NewReader(option, block, reader)`;
+  the old overloads without option only call `abort()`. Name: `"pgm_index"`.
+  Reject any comparator except `BytewiseComparator()`.
+- RocksDB only uses the UDI for reads if `ReadOptions::table_index_factory` is set
+  or `BlockBasedTableOptions::use_udi_as_primary_index` is true. The standard index
+  is always built next to it, so measure the UDI block on its own.
+
+### Builder
+- `AddIndexEntry`: store separator = `last_key_in_current_block` (no shortening),
+  the BlockHandle and a tag. Return the separator (must stay alive, keep it in a vector).
+- Tag (`(seqno << 8) | type`): real tag (`context.last_key_tag`) if the same user key
+  continues in the next block (`Compare(last_key, *first_key_in_next_block) == 0`)
+  or this is the last block; otherwise 0 ("any seqno of this user key belongs here").
+- `Finish`: serialize (format version, entry count, then per entry the separator,
+  tag, offset, size) into a member buffer. `EstimatedSize` must be an upper bound.
+
+### Reader and Iterator
+- Reader parses the block into a vector of entries (separators are Slices into the block).
+- Step 1 uses plain `std::lower_bound` on (separator, tag). Step 2 replaces it with PGM.
+- PGM key = first 8 bytes of the separator as big-endian uint64, zero padded
+  (order preserving; clamp 0xFF..FF, it is PGM's sentinel). Train on the distinct
+  values; remember where each group of equal prefixes starts.
+- Seek(target, target_tag): PGM `search(u64(target))` gives `[lo, hi)`, `lower_bound`
+  in that window gives the prefix group. If the group prefix differs from the target
+  prefix, answer = first entry of the group. Otherwise binary search inside the group on
+  the full key, and on tag for equal keys: an entry is before the target iff
+  `Compare(sep, target) < 0 || (equal && target_tag < entry.tag)`.
+- Past the end: return `kUnknown` with an empty key (not `kOutOfBound`).
+- `CheckBounds` and `Prepare`: copy the pattern from the trie iterator.
+
+### Later (see calendar)
+- Train the model in `Finish` (write time) with first-key and epsilon = 1; measure
+  training time; serialize the model instead of retraining in the reader.
+- Then run_strategies.sh for leveling, tiering and no compaction (RQ1).
+
+### Tests and checks
+- Prefix collisions: keys with few 8-byte prefixes, short keys, keys that are prefixes
+  of others, 0xFF..FF; compare Seek with a linear reference.
+- Same user key across blocks (snapshots), both secondary and primary mode.
+- A seek counter in the iterator, and a deliberate off-by-one that must make `found` drop.
+- `grep -c rocksdb.user_defined_index.pgm_index *.sst` must be 1 for every SST.
+- db_bench: `--use_pgm_index`, `--use_udi_as_primary_index` (see tools/db_bench_tool.cc).
+
