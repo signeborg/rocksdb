@@ -10,6 +10,8 @@
 #include <cassert>
 #include <exception>
 #include <limits>
+#include <chrono>
+#include <cstdio>
 
 #include "pgm/pgm_index.hpp"
 
@@ -47,6 +49,27 @@ Status PgmIndexBuilder::Finish(Slice* index_contents) {
     PutVarint64(&buffer_, e.tag);
     PutVarint64(&buffer_, e.offset);
     PutVarint64(&buffer_, e.size);
+  }
+  // Measure PGM training time at write time (the model is not stored yet).
+  if (!entries_.empty()) {
+    std::vector<uint64_t> prefix_keys;
+    prefix_keys.reserve(entries_.size());
+    for (const Entry& e : entries_) {
+      uint64_t k = KeyToU64(Slice(e.separator));
+      if (prefix_keys.empty() || prefix_keys.back() != k) {
+        prefix_keys.push_back(k);
+      }
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    pgm::PGMIndex<uint64_t, 1, 4, float> train_model(prefix_keys.begin(),
+                                                       prefix_keys.end());
+    auto t1 = std::chrono::steady_clock::now();
+    fprintf(stderr, "PGM_TRAIN keys=%zu segments=%zu bytes=%zu micros=%lld\n",
+            prefix_keys.size(), train_model.segments_count(),
+            train_model.size_in_bytes(),
+            static_cast<long long>(
+                std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                    .count()));
   }
   *index_contents = Slice(buffer_);
   finished_ = true;
