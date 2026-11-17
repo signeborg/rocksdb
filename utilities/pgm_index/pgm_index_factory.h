@@ -52,8 +52,18 @@ class PgmIndexReader final : public UserDefinedIndexReader {
       const ReadOptions& read_options) override;
   size_t ApproximateMemoryUsage() const override;
 
+  struct Entry {
+    Slice separator;
+    uint64_t tag;
+    uint64_t offset;
+    uint64_t size;
+  };
+  size_t NumEntries() const { return entries_.size(); }
+  const Entry& GetEntry(size_t i) const { return entries_[i]; }
+
  private:
   const Comparator* comparator_;
+  std::vector<Entry> entries_;
   size_t data_size_ = 0;
 };
 

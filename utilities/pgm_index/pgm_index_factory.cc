@@ -59,12 +59,35 @@ uint64_t PgmIndexBuilder::EstimatedSize() const {
   return total;
 }
 
-// ---- Reader (stub) ----
+// ---- Reader ----
 PgmIndexReader::PgmIndexReader(const Comparator* comparator)
     : comparator_(comparator) {}
 
 Status PgmIndexReader::InitFromSlice(const Slice& data) {
   data_size_ = data.size();
+  Slice input = data;
+
+  uint32_t version = 0;
+  if (!GetFixed32(&input, &version) || version != 1) {
+    return Status::Corruption("PGM index: bad format version");
+  }
+  uint64_t count = 0;
+  // Each entry takes at least 4 bytes, so a larger count must be corrupt.
+  if (!GetVarint64(&input, &count) || count > input.size()) {
+    return Status::Corruption("PGM index: bad entry count");
+  }
+
+  entries_.clear();
+  entries_.reserve(count);
+  for (uint64_t i = 0; i < count; ++i) {
+    Entry e;
+    if (!GetLengthPrefixedSlice(&input, &e.separator) ||
+        !GetVarint64(&input, &e.tag) || !GetVarint64(&input, &e.offset) ||
+        !GetVarint64(&input, &e.size)) {
+      return Status::Corruption("PGM index: truncated entry");
+    }
+    entries_.push_back(e);
+  }
   return Status::OK();
 }
 
@@ -73,7 +96,9 @@ std::unique_ptr<UserDefinedIndexIterator> PgmIndexReader::NewIterator(
   return std::make_unique<PgmIndexIterator>(this, comparator_);
 }
 
-size_t PgmIndexReader::ApproximateMemoryUsage() const { return data_size_; }
+size_t PgmIndexReader::ApproximateMemoryUsage() const {
+  return data_size_ + entries_.capacity() * sizeof(Entry);
+}
 
 // ---- Iterator (stub) ----
 PgmIndexIterator::PgmIndexIterator(const PgmIndexReader* reader,
