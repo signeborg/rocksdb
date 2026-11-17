@@ -501,3 +501,27 @@ variant will need changes in the block-based table index code later.
 - `grep -c rocksdb.user_defined_index.pgm_index *.sst` must be 1 for every SST.
 - db_bench: `--use_pgm_index`, `--use_udi_as_primary_index` (see tools/db_bench_tool.cc).
 
+
+## PGM index: status 2026-11-17
+
+Done (branch `pgm-index`, remote `fork` = signeborg/rocksdb; `origin` is Meta's, never push there):
+- Per-block PGM UDI in `utilities/pgm_index/` (builder, reader, iterator, factory), flags `--use_pgm_index` and `--use_udi_as_primary_index` in db_bench.
+- Reader trains `pgm::PGMIndex<uint64_t,16,4,float>` on distinct 8-byte big-endian key prefixes; the full separators are still stored (no space saving yet).
+- Correctness: db_bench `found` equals trie and default index (use `--seed=1`); `pgm_collision_test.cc` compares Get/Seek/Next with std::map in primary and secondary mode (ALL OK); a deliberate off-by-one makes it fail.
+- Finish measures model training (eps=1, stderr line `PGM_TRAIN keys= segments= bytes= micros=`); the format is unchanged.
+
+Measurements (5M keys, 16 B/100 B, no compression, IDUN):
+- Index block today: +24 B per data block (trie: +34 B); a trained eps=1 model is about 1.4 kB per 64 MB file (about 200x smaller than the separators).
+- Training: about 350 us per file; leveling 18 models, tiering 18, no compaction 10 (compaction roughly doubles the trained keys).
+- readrandom and seekrandom: no difference between PGM and the default index beyond noise (3 repeats, alternating order, results/2026-11-17_balanced).
+
+Open / next:
+- Store only the model and drop the separators. The PGM library keeps its segments private, so it needs a small change. The UDI returns only a BlockHandle, so an approximate position (+-eps) cannot give the exact block; this is where the UDI interface may be insufficient.
+- Per-key variant needs a position inside the block, which means changes in the block-based index code.
+- More repeats, seekrandom, real key distributions (SOSD), local disk.
+
+Gotchas:
+- db_bench `found` is only comparable with `--seed=1`; default 64 MB write buffer is fine for 5M keys but use `--write_buffer_size=1048576` for small tests.
+- db_bench progress output (carriage returns) pollutes stderr logs; extract measurements with `grep -o`.
+- Slurm allocation lasts 4 h; then `salloc` again, `source ~/rocksdb_env.sh`, rebuild db_bench (`DEBUG_LEVEL=0 make -j8 db_bench`, `AUTO_CLEAN=1` after a Makefile change).
+- Logbook: /mnt/project-files/master/pgm_index/idun_logg_2026-11-17.md (project files).
