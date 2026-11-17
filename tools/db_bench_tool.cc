@@ -101,6 +101,7 @@
 #include "utilities/merge_operators/bytesxor.h"
 #include "utilities/merge_operators/sortlist.h"
 #include "utilities/persistent_cache/block_cache_tier.h"
+#include "utilities/pgm_index/pgm_index_factory.h"
 #include "utilities/trie_index/trie_index_factory.h"
 #ifdef MEMKIND
 #include "memory/memkind_kmem_allocator.h"
@@ -720,6 +721,16 @@ DEFINE_bool(use_trie_index, false,
             "Builds a LOUDS-encoded succinct trie from separator keys, "
             "providing space reduction compared to the default binary search "
             "index. Requires BytewiseComparator.");
+
+DEFINE_bool(use_pgm_index, false,
+            "Use the PGM learned index as user-defined index (UDI) for "
+            "block-based tables (one entry per data block). Requires "
+            "BytewiseComparator. Mutually exclusive with --use_trie_index.");
+
+DEFINE_bool(use_udi_as_primary_index, false,
+            "With --use_trie_index or --use_pgm_index: route all reads, "
+            "including compaction reads, through the UDI "
+            "(BlockBasedTableOptions::use_udi_as_primary_index).");
 
 DEFINE_bool(
     optimize_filters_for_memory,
@@ -4126,7 +4137,7 @@ class Benchmark {
       read_options_.auto_readahead_size = FLAGS_auto_readahead_size;
       read_options_.auto_refresh_iterator_with_snapshot =
           FLAGS_auto_refresh_iterator_with_snapshot;
-      if (FLAGS_use_trie_index && udi_factory_) {
+      if ((FLAGS_use_trie_index || FLAGS_use_pgm_index) && udi_factory_) {
         read_options_.table_index_factory = udi_factory_.get();
       }
 
@@ -5539,9 +5550,21 @@ class Benchmark {
         fprintf(stdout, "Integrated BlobDB: blob cache disabled\n");
       }
 
+      if (FLAGS_use_trie_index && FLAGS_use_pgm_index) {
+        fprintf(stderr,
+                "--use_trie_index and --use_pgm_index are mutually "
+                "exclusive\n");
+        db_bench_exit(1);
+      }
       if (FLAGS_use_trie_index) {
         udi_factory_ = std::make_shared<trie_index::TrieIndexFactory>();
+      } else if (FLAGS_use_pgm_index) {
+        udi_factory_ = std::make_shared<pgm_index::PgmIndexFactory>();
+      }
+      if (udi_factory_) {
         block_based_options.user_defined_index_factory = udi_factory_;
+        block_based_options.use_udi_as_primary_index =
+            FLAGS_use_udi_as_primary_index;
       }
 
       options.table_factory.reset(
