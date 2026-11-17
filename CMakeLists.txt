@@ -1091,6 +1091,7 @@ set(SOURCES
         utilities/transactions/write_prepared_txn_db.cc
         utilities/transactions/write_unprepared_txn.cc
         utilities/transactions/write_unprepared_txn_db.cc
+        utilities/pgm_index/pgm_index_factory.cc
         utilities/trie_index/bitvector.cc
         utilities/trie_index/louds_trie.cc
         utilities/trie_index/trie_index_factory.cc
