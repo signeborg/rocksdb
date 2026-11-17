@@ -610,6 +610,7 @@ endif()
 
 include_directories(${PROJECT_SOURCE_DIR})
 include_directories(${PROJECT_SOURCE_DIR}/include)
+include_directories(SYSTEM ${PROJECT_SOURCE_DIR}/third-party/pgm/include)
 
 if(USE_COROUTINES)
   if(USE_FOLLY OR USE_FOLLY_LITE)

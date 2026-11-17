@@ -472,6 +472,8 @@ else
 	PLATFORM_CCFLAGS += -isystem $(GTEST_DIR)
 	PLATFORM_CXXFLAGS += -isystem $(GTEST_DIR)
 endif
+PGM_DIR = third-party/pgm/include
+PLATFORM_CXXFLAGS += -isystem $(PGM_DIR)
 
 include folly.mk
 
