@@ -61,6 +61,10 @@ class PgmIndexReader final : public UserDefinedIndexReader {
   size_t NumEntries() const { return entries_.size(); }
   const Entry& GetEntry(size_t i) const { return entries_[i]; }
 
+  // Index of the first entry whose (separator, tag) is >= (target,
+  // target_tag) in internal key order, or NumEntries() if there is none.
+  size_t Seek(const Slice& target, uint64_t target_tag) const;
+
  private:
   const Comparator* comparator_;
   std::vector<Entry> entries_;
@@ -71,14 +75,26 @@ class PgmIndexIterator final : public UserDefinedIndexIterator {
  public:
   PgmIndexIterator(const PgmIndexReader* reader, const Comparator* comparator);
   void Prepare(const ScanOptions scan_opts[], size_t num_opts) override;
+  Status SeekToFirstAndGetResult(IterateResult* result) override;
+  Status SeekToLastAndGetResult(IterateResult* result) override;
+  Status PrevAndGetResult(IterateResult* result) override;
   Status SeekAndGetResult(const Slice& target, IterateResult* result,
                           const SeekContext& context) override;
   Status NextAndGetResult(IterateResult* result) override;
   UserDefinedIndexBuilder::BlockHandle value() override;
 
  private:
+  IterBoundCheck CheckBounds(const Slice& reference_key) const;
+  // Fills result for pos_; returns false (and an invalid result) if pos_ is
+  // past the last entry.
+  bool SetResult(IterateResult* result);
+
   const PgmIndexReader* reader_;
   const Comparator* comparator_;
+  size_t pos_;
+  std::vector<ScanOptions> scan_opts_;
+  size_t current_scan_idx_ = 0;
+  bool prepared_ = false;
 };
 
 class PgmIndexFactory : public UserDefinedIndexFactory {

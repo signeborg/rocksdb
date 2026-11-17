@@ -100,26 +100,130 @@ size_t PgmIndexReader::ApproximateMemoryUsage() const {
   return data_size_ + entries_.capacity() * sizeof(Entry);
 }
 
-// ---- Iterator (stub) ----
-PgmIndexIterator::PgmIndexIterator(const PgmIndexReader* reader,
-                                   const Comparator* comparator)
-    : reader_(reader), comparator_(comparator) {}
-
-void PgmIndexIterator::Prepare(const ScanOptions /*scan_opts*/[],
-                               size_t /*num_opts*/) {}
-
-Status PgmIndexIterator::SeekAndGetResult(const Slice& /*target*/,
-                                          IterateResult* /*result*/,
-                                          const SeekContext& /*context*/) {
-  return Status::NotSupported("TODO");
+// ---- Reader::Seek (plain binary search, PGM comes later) ----
+size_t PgmIndexReader::Seek(const Slice& target, uint64_t target_tag) const {
+  size_t lo = 0;
+  size_t hi = entries_.size();
+  while (lo < hi) {
+    const size_t mid = lo + (hi - lo) / 2;
+    const Entry& e = entries_[mid];
+    const int c = comparator_->Compare(e.separator, target);
+    // Higher tag sorts first, so an equal key with a higher tag is before.
+    const bool before = c < 0 || (c == 0 && target_tag < e.tag);
+    if (before) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
 }
 
-Status PgmIndexIterator::NextAndGetResult(IterateResult* /*result*/) {
-  return Status::NotSupported("TODO");
+// ---- Iterator ----
+PgmIndexIterator::PgmIndexIterator(const PgmIndexReader* reader,
+                                   const Comparator* comparator)
+    : reader_(reader), comparator_(comparator), pos_(reader->NumEntries()) {}
+
+void PgmIndexIterator::Prepare(const ScanOptions scan_opts[], size_t num_opts) {
+  scan_opts_.assign(scan_opts, scan_opts + num_opts);
+  current_scan_idx_ = 0;
+  prepared_ = true;
+}
+
+bool PgmIndexIterator::SetResult(IterateResult* result) {
+  if (pos_ >= reader_->NumEntries()) {
+    pos_ = reader_->NumEntries();
+    // Running out of entries says nothing about the upper bound.
+    result->bound_check_result = IterBoundCheck::kUnknown;
+    result->key = Slice();
+    return false;
+  }
+  result->key = reader_->GetEntry(pos_).separator;
+  return true;
+}
+
+Status PgmIndexIterator::SeekToFirstAndGetResult(IterateResult* result) {
+  pos_ = 0;
+  if (SetResult(result)) {
+    result->bound_check_result = IterBoundCheck::kInbound;
+  }
+  return Status::OK();
+}
+
+Status PgmIndexIterator::SeekToLastAndGetResult(IterateResult* result) {
+  pos_ = reader_->NumEntries() == 0 ? 0 : reader_->NumEntries() - 1;
+  if (SetResult(result)) {
+    result->bound_check_result = IterBoundCheck::kInbound;
+  }
+  return Status::OK();
+}
+
+Status PgmIndexIterator::PrevAndGetResult(IterateResult* result) {
+  if (pos_ == 0 || pos_ > reader_->NumEntries()) {
+    pos_ = reader_->NumEntries();
+  } else {
+    --pos_;
+  }
+  if (SetResult(result)) {
+    result->bound_check_result = IterBoundCheck::kInbound;
+  }
+  return Status::OK();
+}
+
+Status PgmIndexIterator::SeekAndGetResult(const Slice& target,
+                                          IterateResult* result,
+                                          const SeekContext& context) {
+  if (prepared_) {
+    while (current_scan_idx_ < scan_opts_.size()) {
+      const auto& opts = scan_opts_[current_scan_idx_];
+      if (opts.range.limit.has_value() &&
+          comparator_->Compare(target, opts.range.limit.value()) >= 0) {
+        current_scan_idx_++;
+      } else {
+        break;
+      }
+    }
+  }
+  pos_ = reader_->Seek(target, context.target_tag);
+  if (SetResult(result)) {
+    result->bound_check_result = CheckBounds(target);
+  }
+  return Status::OK();
+}
+
+Status PgmIndexIterator::NextAndGetResult(IterateResult* result) {
+  if (pos_ >= reader_->NumEntries()) {
+    SetResult(result);
+    return Status::OK();
+  }
+  const Slice prev = reader_->GetEntry(pos_).separator;
+  ++pos_;
+  if (SetResult(result)) {
+    result->bound_check_result = CheckBounds(prev);
+  }
+  return Status::OK();
 }
 
 UserDefinedIndexBuilder::BlockHandle PgmIndexIterator::value() {
-  return UserDefinedIndexBuilder::BlockHandle{0, 0};
+  const auto& e = reader_->GetEntry(pos_);
+  return UserDefinedIndexBuilder::BlockHandle{e.offset, e.size};
+}
+
+IterBoundCheck PgmIndexIterator::CheckBounds(const Slice& reference_key) const {
+  if (!prepared_ || scan_opts_.empty()) {
+    return IterBoundCheck::kInbound;
+  }
+  if (current_scan_idx_ >= scan_opts_.size()) {
+    return IterBoundCheck::kOutOfBound;
+  }
+  const auto& opts = scan_opts_[current_scan_idx_];
+  // Separators are upper bounds of block contents, so compare the reference
+  // key (seek target / previous separator), not the current separator.
+  if (opts.range.limit.has_value() &&
+      comparator_->Compare(reference_key, opts.range.limit.value()) >= 0) {
+    return IterBoundCheck::kOutOfBound;
+  }
+  return IterBoundCheck::kInbound;
 }
 
 // ---- Factory ----
