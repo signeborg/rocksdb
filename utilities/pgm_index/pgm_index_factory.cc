@@ -12,11 +12,56 @@
 #include <limits>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 
 #include "pgm/pgm_index.hpp"
 
 namespace ROCKSDB_NAMESPACE {
 namespace pgm_index {
+
+// PGM model that can be written to and read from the index block.
+class PgmModel : public pgm::PGMIndex<uint64_t, 16, 4, float> {
+ public:
+  PgmModel() = default;
+  explicit PgmModel(const std::vector<uint64_t>& keys)
+      : pgm::PGMIndex<uint64_t, 16, 4, float>(keys.begin(), keys.end()) {}
+
+  void EncodeTo(std::string* dst) const {
+    PutVarint64(dst, n);
+    PutFixed64(dst, first_key);
+    PutVarint64(dst, segments.size());
+    dst->append(reinterpret_cast<const char*>(segments.data()),
+                segments.size() * sizeof(Segment));
+    PutVarint64(dst, levels_offsets.size());
+    for (size_t off : levels_offsets) {
+      PutVarint64(dst, off);
+    }
+  }
+
+  bool DecodeFrom(Slice* input) {
+    uint64_t n64 = 0, first = 0, num_segments = 0, num_levels = 0;
+    if (!GetVarint64(input, &n64) || !GetFixed64(input, &first) ||
+        !GetVarint64(input, &num_segments) ||
+        num_segments > input->size() / sizeof(Segment)) {
+      return false;
+    }
+    segments.resize(num_segments);
+    memcpy(segments.data(), input->data(), num_segments * sizeof(Segment));
+    input->remove_prefix(num_segments * sizeof(Segment));
+    if (!GetVarint64(input, &num_levels) || num_levels > input->size()) {
+      return false;
+    }
+    levels_offsets.assign(num_levels, 0);
+    for (uint64_t i = 0; i < num_levels; ++i) {
+      uint64_t off = 0;
+      if (!GetVarint64(input, &off)) return false;
+      levels_offsets[i] = off;
+    }
+    n = n64;
+    first_key = first;
+    return true;
+  }
+};
 
 // ---- Builder ----
 PgmIndexBuilder::PgmIndexBuilder(const Comparator* comparator)
@@ -42,7 +87,7 @@ Slice PgmIndexBuilder::AddIndexEntry(const Slice& last_key_in_current_block,
 
 Status PgmIndexBuilder::Finish(Slice* index_contents) {
   buffer_.clear();
-  PutFixed32(&buffer_, 1);  // format version
+  PutFixed32(&buffer_, 2);  // format version 2: entries, then the model
   PutVarint64(&buffer_, entries_.size());
   for (const Entry& e : entries_) {
     PutLengthPrefixedSlice(&buffer_, Slice(e.separator));
@@ -50,23 +95,25 @@ Status PgmIndexBuilder::Finish(Slice* index_contents) {
     PutVarint64(&buffer_, e.offset);
     PutVarint64(&buffer_, e.size);
   }
-  // Measure PGM training time at write time (the model is not stored yet).
-  if (!entries_.empty()) {
-    std::vector<uint64_t> prefix_keys;
-    prefix_keys.reserve(entries_.size());
-    for (const Entry& e : entries_) {
-      uint64_t k = KeyToU64(Slice(e.separator));
-      if (prefix_keys.empty() || prefix_keys.back() != k) {
-        prefix_keys.push_back(k);
-      }
+  // Distinct 8-byte prefixes (the same as the reader builds).
+  std::vector<uint64_t> prefix_keys;
+  prefix_keys.reserve(entries_.size());
+  for (const Entry& e : entries_) {
+    uint64_t k = KeyToU64(Slice(e.separator));
+    if (prefix_keys.empty() || prefix_keys.back() != k) {
+      prefix_keys.push_back(k);
     }
+  }
+  if (prefix_keys.empty()) {
+    buffer_.push_back(0);  // no model
+  } else {
+    buffer_.push_back(1);  // a model follows
     auto t0 = std::chrono::steady_clock::now();
-    pgm::PGMIndex<uint64_t, 1, 4, float> train_model(prefix_keys.begin(),
-                                                       prefix_keys.end());
+    PgmModel model(prefix_keys);
     auto t1 = std::chrono::steady_clock::now();
+    model.EncodeTo(&buffer_);
     fprintf(stderr, "PGM_TRAIN keys=%zu segments=%zu bytes=%zu micros=%lld\n",
-            prefix_keys.size(), train_model.segments_count(),
-            train_model.size_in_bytes(),
+            prefix_keys.size(), model.segments_count(), model.size_in_bytes(),
             static_cast<long long>(
                 std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
                     .count()));
@@ -80,10 +127,11 @@ uint64_t PgmIndexBuilder::EstimatedSize() const {
   if (finished_) {
     return buffer_.size();
   }
-  // Upper bound: version + count + per entry (length + 3 varints <= 35 B).
-  uint64_t total = 4 + 10;
+  // Upper bound: version + count + per entry (length + 3 varints <= 35 B),
+  // plus the model flag and at most 48 B per entry for the model.
+  uint64_t total = 4 + 10 + 1 + 64;
   for (const Entry& e : entries_) {
-    total += e.separator.size() + 35;
+    total += e.separator.size() + 35 + 48;
   }
   return total;
 }
@@ -103,9 +151,9 @@ uint64_t KeyToU64(const Slice& key) {
 
 // PGM model: error at most 16 positions at the bottom level, 4 above.
 struct PgmModelHolder {
-  using Model = pgm::PGMIndex<uint64_t, 16, 4, float>;
-  explicit PgmModelHolder(const std::vector<uint64_t>& keys)
-      : model(keys.begin(), keys.end()) {}
+  using Model = PgmModel;
+  PgmModelHolder() = default;
+  explicit PgmModelHolder(const std::vector<uint64_t>& keys) : model(keys) {}
   Model model;
 };
 
@@ -120,7 +168,7 @@ Status PgmIndexReader::InitFromSlice(const Slice& data) {
   Slice input = data;
 
   uint32_t version = 0;
-  if (!GetFixed32(&input, &version) || version != 1) {
+  if (!GetFixed32(&input, &version) || (version != 1 && version != 2)) {
     return Status::Corruption("PGM index: bad format version");
   }
   uint64_t count = 0;
@@ -141,6 +189,22 @@ Status PgmIndexReader::InitFromSlice(const Slice& data) {
     entries_.push_back(e);
   }
 
+  // Version 2: the trained model follows the entries.
+  std::unique_ptr<PgmModelHolder> stored_model;
+  if (version == 2) {
+    if (input.empty()) {
+      return Status::Corruption("PGM index: missing model flag");
+    }
+    const char has_model = input[0];
+    input.remove_prefix(1);
+    if (has_model == 1) {
+      stored_model = std::make_unique<PgmModelHolder>();
+      if (!stored_model->model.DecodeFrom(&input)) {
+        return Status::Corruption("PGM index: bad model");
+      }
+    }
+  }
+
   // Distinct 8-byte prefixes, and where each group of equal prefixes starts.
   prefixes_.clear();
   group_start_.clear();
@@ -156,9 +220,11 @@ Status PgmIndexReader::InitFromSlice(const Slice& data) {
   }
   group_start_.push_back(static_cast<uint32_t>(entries_.size()));
 
-  // Train the PGM model on the distinct prefixes.
+  // Use the stored model if there is one, otherwise train on the prefixes.
   pgm_.reset();
-  if (!prefixes_.empty()) {
+  if (stored_model) {
+    pgm_ = std::move(stored_model);
+  } else if (!prefixes_.empty()) {
     try {
       pgm_ = std::make_unique<PgmModelHolder>(prefixes_);
     } catch (const std::exception& ex) {
