@@ -283,6 +283,21 @@ size_t PgmIndexReader::Seek(const Slice& target, uint64_t target_tag) const {
   const auto approx = pgm_->model.search(k);
   const auto first = prefixes_.begin() + approx.lo;
   const auto last = prefixes_.begin() + approx.hi;
+  if (std::getenv("PGM_WIN_LOG") != nullptr) {
+    static uint64_t n_seek = 0, sum_win = 0, max_win = 0;
+    const uint64_t w = approx.hi - approx.lo;
+    const uint64_t n = __atomic_add_fetch(&n_seek, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&sum_win, w, __ATOMIC_RELAXED);
+    if (w > __atomic_load_n(&max_win, __ATOMIC_RELAXED)) {
+      __atomic_store_n(&max_win, w, __ATOMIC_RELAXED);
+    }
+    if (n % 200000 == 0) {
+      fprintf(stderr, "PGM_WIN seeks=%llu avg_window=%.3f max_window=%llu\n",
+              (unsigned long long)n,
+              (double)__atomic_load_n(&sum_win, __ATOMIC_RELAXED) / n,
+              (unsigned long long)__atomic_load_n(&max_win, __ATOMIC_RELAXED));
+    }
+  }
   size_t g =
       static_cast<size_t>(std::lower_bound(first, last, k) - prefixes_.begin());
   // The model guarantees the window. Guard anyway, so a model bug can never
@@ -293,6 +308,23 @@ size_t PgmIndexReader::Seek(const Slice& target, uint64_t target_tag) const {
     g = static_cast<size_t>(
         std::lower_bound(prefixes_.begin(), prefixes_.end(), k) -
         prefixes_.begin());
+  }
+  if (std::getenv("PGM_WIN_LOG") != nullptr) {
+    static uint64_t e_n = 0, e_sum = 0, e_max = 0, e_zero = 0;
+    const uint64_t err = g > approx.pos ? g - approx.pos : approx.pos - g;
+    const uint64_t n = __atomic_add_fetch(&e_n, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&e_sum, err, __ATOMIC_RELAXED);
+    if (err == 0) __atomic_add_fetch(&e_zero, 1, __ATOMIC_RELAXED);
+    if (err > __atomic_load_n(&e_max, __ATOMIC_RELAXED)) {
+      __atomic_store_n(&e_max, err, __ATOMIC_RELAXED);
+    }
+    if (n % 200000 == 0) {
+      fprintf(stderr, "PGM_ERR seeks=%llu avg_err=%.3f max_err=%llu zero_frac=%.3f\n",
+              (unsigned long long)n,
+              (double)__atomic_load_n(&e_sum, __ATOMIC_RELAXED) / n,
+              (unsigned long long)__atomic_load_n(&e_max, __ATOMIC_RELAXED),
+              (double)__atomic_load_n(&e_zero, __ATOMIC_RELAXED) / n);
+    }
   }
   if (g == num_groups) {
     return entries_.size();
