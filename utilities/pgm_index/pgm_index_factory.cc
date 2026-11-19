@@ -12,6 +12,7 @@
 #include <limits>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "pgm/pgm_index.hpp"
@@ -231,6 +232,16 @@ Status PgmIndexReader::InitFromSlice(const Slice& data) {
       return Status::Corruption(std::string("PGM index: training failed: ") +
                                 ex.what());
     }
+  }
+  if (std::getenv("PGM_MEM_LOG") != nullptr) {
+    fprintf(stderr,
+            "PGM_MEM data=%zu entries=%zu prefixes=%zu groups=%zu model=%zu "
+            "total=%zu\n",
+            data_size_, entries_.capacity() * sizeof(Entry),
+            prefixes_.capacity() * sizeof(uint64_t),
+            group_start_.capacity() * sizeof(uint32_t),
+            pgm_ ? pgm_->model.size_in_bytes() : size_t{0},
+            ApproximateMemoryUsage());
   }
   return Status::OK();
 }
