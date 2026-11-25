@@ -67,12 +67,12 @@ class PgmIndexReader final : public UserDefinedIndexReader {
     uint32_t sep_len;
     uint64_t prefix;
     uint64_t tag;
-    uint64_t offset;
     uint64_t size;
   };
   size_t NumEntries() const { return entries_.size(); }
   const Entry& GetEntry(size_t i) const { return entries_[i]; }
   Slice SeparatorOf(size_t i, std::string* scratch) const;
+  uint64_t OffsetOf(size_t i) const;
   Slice Sep(const Entry& e) const { return Slice(base_ + e.sep_off, e.sep_len); }
   size_t NumSegments() const;
 
@@ -88,6 +88,9 @@ class PgmIndexReader final : public UserDefinedIndexReader {
   std::vector<Entry> entries_;
   size_t data_size_ = 0;
   const char* base_ = nullptr;
+  // Block offsets: every 16th block in format v4, every block otherwise.
+  std::vector<uint64_t> offsets_;
+  size_t offset_step_ = 1;
   // Distinct KeyToU64(separator) values, ascending, and for each the index
   // of its first entry. group_start_[prefixes_.size()] == entries_.size().
   std::vector<uint64_t> prefixes_;

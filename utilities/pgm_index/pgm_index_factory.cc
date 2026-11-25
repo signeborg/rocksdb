@@ -216,8 +216,12 @@ Status PgmIndexReader::InitFromSlice(const Slice& data) {
 
   entries_.clear();
   entries_.reserve(count);
+  offset_step_ = version >= 4 ? 16 : 1;
+  offsets_.clear();
+  offsets_.reserve(count / offset_step_ + 1);
   for (uint64_t i = 0; i < count; ++i) {
     Entry e;
+    uint64_t off = 0;
     e.sep_off = 0;
     e.sep_len = 0;
     e.prefix = 0;
@@ -239,13 +243,16 @@ Status PgmIndexReader::InitFromSlice(const Slice& data) {
       e.sep_len = static_cast<uint32_t>(sep.size());
     }
     if (!GetVarint64(&input, &e.tag) ||
-        (version < 4 && !GetVarint64(&input, &e.offset)) ||
+        (version < 4 && !GetVarint64(&input, &off)) ||
         !GetVarint64(&input, &e.size)) {
       return Status::Corruption("PGM index: truncated entry");
     }
     if (version >= 4) {
-      e.offset = next_offset;
+      off = next_offset;
       next_offset += e.size + 5;
+    }
+    if (i % offset_step_ == 0) {
+      offsets_.push_back(off);
     }
     if (version < 3) {
       e.prefix = KeyToU64(Sep(e));
@@ -309,6 +316,14 @@ Status PgmIndexReader::InitFromSlice(const Slice& data) {
   return Status::OK();
 }
 
+uint64_t PgmIndexReader::OffsetOf(size_t i) const {
+  uint64_t off = offsets_[i / offset_step_];
+  for (size_t j = i - i % offset_step_; j < i; ++j) {
+    off += entries_[j].size + 5;
+  }
+  return off;
+}
+
 size_t PgmIndexReader::NumSegments() const {
   return pgm_ ? pgm_->model.segments_count() : 0;
 }
@@ -320,6 +335,7 @@ std::unique_ptr<UserDefinedIndexIterator> PgmIndexReader::NewIterator(
 
 size_t PgmIndexReader::ApproximateMemoryUsage() const {
   return data_size_ + entries_.capacity() * sizeof(Entry) +
+         offsets_.capacity() * sizeof(uint64_t) +
          prefixes_.capacity() * sizeof(uint64_t) +
          group_start_.capacity() * sizeof(uint32_t) +
          (pgm_ ? sizeof(PgmModelHolder) + pgm_->model.size_in_bytes() : 0);
@@ -520,7 +536,7 @@ Status PgmIndexIterator::NextAndGetResult(IterateResult* result) {
 
 UserDefinedIndexBuilder::BlockHandle PgmIndexIterator::value() {
   const auto& e = reader_->GetEntry(pos_);
-  return UserDefinedIndexBuilder::BlockHandle{e.offset, e.size};
+  return UserDefinedIndexBuilder::BlockHandle{reader_->OffsetOf(pos_), e.size};
 }
 
 IterBoundCheck PgmIndexIterator::CheckBounds(const Slice& reference_key) const {
