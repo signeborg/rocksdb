@@ -63,7 +63,8 @@ class PgmIndexReader final : public UserDefinedIndexReader {
   size_t ApproximateMemoryUsage() const override;
 
   struct Entry {
-    Slice separator;
+    uint32_t sep_off;
+    uint32_t sep_len;
     uint64_t prefix;
     uint64_t tag;
     uint64_t offset;
@@ -72,6 +73,7 @@ class PgmIndexReader final : public UserDefinedIndexReader {
   size_t NumEntries() const { return entries_.size(); }
   const Entry& GetEntry(size_t i) const { return entries_[i]; }
   Slice SeparatorOf(size_t i, std::string* scratch) const;
+  Slice Sep(const Entry& e) const { return Slice(base_ + e.sep_off, e.sep_len); }
   size_t NumSegments() const;
 
   // Index of the first entry whose (separator, tag) is >= (target,
@@ -85,6 +87,7 @@ class PgmIndexReader final : public UserDefinedIndexReader {
   const Comparator* comparator_;
   std::vector<Entry> entries_;
   size_t data_size_ = 0;
+  const char* base_ = nullptr;
   // Distinct KeyToU64(separator) values, ascending, and for each the index
   // of its first entry. group_start_[prefixes_.size()] == entries_.size().
   std::vector<uint64_t> prefixes_;

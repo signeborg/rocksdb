@@ -93,8 +93,21 @@ Slice PgmIndexBuilder::AddIndexEntry(const Slice& last_key_in_current_block,
 
 Status PgmIndexBuilder::Finish(Slice* index_contents) {
   buffer_.clear();
-  PutFixed32(&buffer_, 3);  // format version 3: compact entries, then the model
+  // Data blocks are written one after another, each followed by a 5 byte
+  // trailer. If that holds for every block, offsets are derived from sizes.
+  bool contiguous = true;
+  for (size_t i = 1; i < entries_.size(); ++i) {
+    if (entries_[i].offset !=
+        entries_[i - 1].offset + entries_[i - 1].size + 5) {
+      contiguous = false;
+      break;
+    }
+  }
+  PutFixed32(&buffer_, contiguous ? 4 : 3);  // v4: offsets derived from sizes
   PutVarint64(&buffer_, entries_.size());
+  if (contiguous && !entries_.empty()) {
+    PutVarint64(&buffer_, entries_[0].offset);
+  }
   for (size_t i = 0; i < entries_.size(); ++i) {
     const Entry& e = entries_[i];
     const uint64_t k = KeyToU64(Slice(e.separator));
@@ -109,7 +122,9 @@ Status PgmIndexBuilder::Finish(Slice* index_contents) {
       PutLengthPrefixedSlice(&buffer_, Slice(e.separator));
     }
     PutVarint64(&buffer_, e.tag);
-    PutVarint64(&buffer_, e.offset);
+    if (!contiguous) {
+      PutVarint64(&buffer_, e.offset);
+    }
     PutVarint64(&buffer_, e.size);
   }
   // Distinct 8-byte prefixes (the same as the reader builds).
@@ -182,10 +197,11 @@ PgmIndexReader::~PgmIndexReader() = default;
 
 Status PgmIndexReader::InitFromSlice(const Slice& data) {
   data_size_ = data.size();
+  base_ = data.data();
   Slice input = data;
 
   uint32_t version = 0;
-  if (!GetFixed32(&input, &version) || (version < 1 || version > 3)) {
+  if (!GetFixed32(&input, &version) || (version < 1 || version > 4)) {
     return Status::Corruption("PGM index: bad format version");
   }
   uint64_t count = 0;
@@ -193,12 +209,17 @@ Status PgmIndexReader::InitFromSlice(const Slice& data) {
   if (!GetVarint64(&input, &count) || count > input.size()) {
     return Status::Corruption("PGM index: bad entry count");
   }
+  uint64_t next_offset = 0;
+  if (version >= 4 && count > 0 && !GetVarint64(&input, &next_offset)) {
+    return Status::Corruption("PGM index: truncated offset");
+  }
 
   entries_.clear();
   entries_.reserve(count);
   for (uint64_t i = 0; i < count; ++i) {
     Entry e;
-    e.separator = Slice();
+    e.sep_off = 0;
+    e.sep_len = 0;
     e.prefix = 0;
     bool has_separator = true;
     if (version >= 3) {
@@ -209,15 +230,25 @@ Status PgmIndexReader::InitFromSlice(const Slice& data) {
       has_separator = input[0] != 0;
       input.remove_prefix(1);
     }
-    if (has_separator && !GetLengthPrefixedSlice(&input, &e.separator)) {
+    Slice sep;
+    if (has_separator && !GetLengthPrefixedSlice(&input, &sep)) {
       return Status::Corruption("PGM index: truncated entry");
     }
-    if (!GetVarint64(&input, &e.tag) || !GetVarint64(&input, &e.offset) ||
+    if (has_separator) {
+      e.sep_off = static_cast<uint32_t>(sep.data() - data.data());
+      e.sep_len = static_cast<uint32_t>(sep.size());
+    }
+    if (!GetVarint64(&input, &e.tag) ||
+        (version < 4 && !GetVarint64(&input, &e.offset)) ||
         !GetVarint64(&input, &e.size)) {
       return Status::Corruption("PGM index: truncated entry");
     }
+    if (version >= 4) {
+      e.offset = next_offset;
+      next_offset += e.size + 5;
+    }
     if (version < 3) {
-      e.prefix = KeyToU64(e.separator);
+      e.prefix = KeyToU64(Sep(e));
     }
     entries_.push_back(e);
   }
@@ -297,15 +328,15 @@ size_t PgmIndexReader::ApproximateMemoryUsage() const {
 bool PgmIndexReader::EntryBefore(size_t i, const Slice& target,
                                  uint64_t target_tag) const {
   const Entry& e = entries_[i];
-  const int c = comparator_->Compare(e.separator, target);
+  const int c = comparator_->Compare(Sep(e), target);
   // Higher tag sorts first, so an equal key with a higher tag is before.
   return c < 0 || (c == 0 && target_tag < e.tag);
 }
 
 Slice PgmIndexReader::SeparatorOf(size_t i, std::string* scratch) const {
   const Entry& e = entries_[i];
-  if (!e.separator.empty()) {
-    return e.separator;
+  if (e.sep_len != 0) {
+    return Sep(e);
   }
   // Not stored: the 8-byte prefix followed by 0xFF bytes is at least as large
   // as every key with this prefix and smaller than the next block.
@@ -387,7 +418,7 @@ size_t PgmIndexReader::Seek(const Slice& target, uint64_t target_tag) const {
   }
   // One block without a stored separator: return it. RocksDB moves on to the
   // next block if the key is not in this one.
-  if (hi - lo == 1 && entries_[lo].separator.empty()) {
+  if (hi - lo == 1 && entries_[lo].sep_len == 0) {
     return lo;
   }
   while (lo < hi) {
