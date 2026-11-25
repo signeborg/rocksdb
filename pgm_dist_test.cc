@@ -63,9 +63,14 @@ int main(int argc, char** argv) {
   Options options;
   options.create_if_missing = true;
   options.compression = kNoCompression;
-  options.disable_auto_compactions = true;
-  options.level0_slowdown_writes_trigger = 100000;
-  options.level0_stop_writes_trigger = 100000;
+  const std::string strat = argc > 4 ? argv[4] : "none";
+  if (strat == "none") {
+    options.disable_auto_compactions = true;
+    options.level0_slowdown_writes_trigger = 100000;
+    options.level0_stop_writes_trigger = 100000;
+  } else if (strat == "universal") {
+    options.compaction_style = kCompactionStyleUniversal;
+  }
   BlockBasedTableOptions table_options;
   auto factory = std::make_shared<pgm_index::PgmIndexFactory>();
   table_options.user_defined_index_factory = factory;
@@ -87,6 +92,7 @@ int main(int argc, char** argv) {
   }
   s = db->Flush(FlushOptions());
   if (!s.ok()) { fprintf(stderr, "flush failed: %s\n", s.ToString().c_str()); return 1; }
+  db->WaitForCompact(WaitForCompactOptions());
   double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   std::string nfiles;
   db->GetProperty("rocksdb.num-files-at-level0", &nfiles);
