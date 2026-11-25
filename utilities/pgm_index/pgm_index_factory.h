@@ -37,6 +37,7 @@ class PgmIndexBuilder final : public UserDefinedIndexBuilder {
     uint64_t tag;
     uint64_t offset;
     uint64_t size;
+    bool next_same_prefix;
   };
   const Comparator* comparator_;
   std::vector<Entry> entries_;
@@ -63,12 +64,14 @@ class PgmIndexReader final : public UserDefinedIndexReader {
 
   struct Entry {
     Slice separator;
+    uint64_t prefix;
     uint64_t tag;
     uint64_t offset;
     uint64_t size;
   };
   size_t NumEntries() const { return entries_.size(); }
   const Entry& GetEntry(size_t i) const { return entries_[i]; }
+  Slice SeparatorOf(size_t i, std::string* scratch) const;
   size_t NumSegments() const;
 
   // Index of the first entry whose (separator, tag) is >= (target,
@@ -113,6 +116,7 @@ class PgmIndexIterator final : public UserDefinedIndexIterator {
   std::vector<ScanOptions> scan_opts_;
   size_t current_scan_idx_ = 0;
   bool prepared_ = false;
+  std::string key_buf_;
 };
 
 class PgmIndexFactory : public UserDefinedIndexFactory {
